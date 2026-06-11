@@ -778,7 +778,8 @@ def _translate_one_batch(
 
             return translations
         except (json.JSONDecodeError, ValueError, KeyError, IndexError) as e:
-            raise RuntimeError(f"Batch translation parse error: {e}")
+            last_err = e
+            time.sleep(RETRY_DELAY * attempt)
         except urllib.error.HTTPError as e:
             last_err = RuntimeError(f"HTTP {e.code}")
             if e.code == 429:
@@ -940,44 +941,24 @@ def _separate_trailing_structural(sentences: List[str]) -> List[str]:
     return result
 
 
-def _small_note(text: str) -> str:
-    """Format text as an indented small-font annotation (blockquote + small).
-
-    Lines that are purely math fences or LaTeX commands are NOT wrapped
-    in ``<small>`` so they render as regular math blocks.
-    """
-    lines = text.split("\n")
-    result: List[str] = []
-    in_math = False
-    for line in lines:
-        stripped = line.strip()
-        if stripped == "$$":
-            in_math = not in_math
-            result.append(f"> {line}")
-        elif in_math:
-            # Inside $$...$$, everything is math — output as-is
-            result.append(f"> {line}")
-        elif _MATH_CMD.match(stripped):
-            # Standalone LaTeX command outside explicit $$ fence
-            result.append(f"> {line}")
-        elif not line:
-            result.append(">")
-        else:
-            result.append(f"> <small>{line}</small>")
-    return "\n".join(result)
-
-
 def _format_bilingual_chunk(
     orig_sentences: List[str],
     trans_sentences: List[str],
-) -> str:
-    """Create bilingual output from pre-aligned 1:1 sentence arrays.
+    start_num: int = 1,
+) -> Tuple[str, int]:
+    """Create bilingual output with English/Chinese sentence pairs.
 
-    Both arrays MUST have the same length — the caller guarantees this
-    by splitting only the English side and translating each sentence
-    individually.  Structural elements (math blocks, code blocks) are
-    emitted once; headings emit the translation; prose emits original +
-    ``<small>`` translation pair.
+    Each prose sentence pair gets a tightly-coupled group::
+
+        English text
+        中文翻译
+
+    Consecutive groups are separated by ``***``.  Structural blocks
+    (math, code) and headings are emitted standalone, also separated
+    by ``***`` from surrounding content.
+
+    Returns ``(formatted_text, next_available_number)`` so numbering
+    can continue across chunks.
     """
     if len(orig_sentences) != len(trans_sentences):
         raise ValueError(
@@ -986,11 +967,17 @@ def _format_bilingual_chunk(
         )
 
     out: List[str] = []
+    n = start_num
+    first = True
+
+    def _separator() -> None:
+        if not first:
+            out.append("***")
+            out.append("")
+
     for os_, ts in zip(orig_sentences, trans_sentences):
         os_stripped = os_.strip()
-
         if not os_stripped:
-            out.append("")
             continue
 
         # Structural: math/code blocks, LaTeX environments — original only
@@ -999,42 +986,157 @@ def _format_bilingual_chunk(
             r"|\$\$|```|~~~|\\begin|\\end)",
             os_stripped,
         ):
+            _separator()
             out.append(os_)
             out.append("")
+            first = False
 
         # Heading — emit the translation (heading markdown preserved)
         elif re.match(r"^#{1,6}\s", os_stripped):
+            _separator()
             out.append(ts)
             out.append("")
+            first = False
 
-        # Prose — original sentence + Chinese translation in <small>
+        # Prose — tightly-coupled English / Chinese pair
         else:
+            _separator()
             out.append(os_)
-            out.append(_small_note(ts))
+            out.append(ts)
             out.append("")
+            n += 1
+            first = False
 
-    return _dedup_bilingual("\n".join(out).strip())
+    return "\n".join(out).strip(), n
 
 
-def _dedup_bilingual(text: str) -> str:
-    """Remove blockquoted math blocks that duplicate plain ones,
-    and strip lone ``> $$`` artefacts left over from split math blocks."""
-    changed = True
-    while changed:
-        changed = False
-        for m in re.finditer(r"> \$\$\n(.*?)\n> \$\$", text, re.DOTALL):
-            bq_content = m.group(1)
-            plain = "\n".join(
-                ln[2:] if ln.startswith("> ") else ln
-                for ln in bq_content.split("\n")
+def _fix_adjacent_inline_math(text: str) -> str:
+    """Separate adjacent inline-math blocks whose ``$$...$$`` concatenation
+    creates an accidental display-math opener.
+
+    When the LLM drops the space between two ``⟨INLINEMATH:N⟩`` placeholders,
+    the restored text becomes ``$a$$b$`` — the middle ``$$`` looks like
+    display-math to every downstream regex.  Real display-math ``$$`` is
+    *always* at the start of a line (it originates from a ``⟨MATHBLOCK:N⟩``
+    placeholder on its own line), so we only touch inline occurrences.
+    """
+    # Pattern: $content$ immediately followed by $content$ on the SAME line.
+    # [^$\n] ensures we stay within a single line and don't cross $ boundaries.
+    # Loop because a single replacement can leave a second adjacent pair
+    # (e.g. "$a$$b$$c$" → "$a$ $b$$c$" needs a second pass for "$b$$c$").
+    pat = re.compile(r"\$([^$\n]+)\$\$([^$\n]+)\$")
+    for _ in range(5):  # at most 5 adjacent blocks in practice
+        new_text = pat.sub(r"$\1$ $\2$", text)
+        if new_text == text:
+            break
+        text = new_text
+    return text
+
+
+def _validate_and_fix_inline_math(
+    text: str,
+    api_key: str,
+    model: str,
+    src: str,
+    tgt: str,
+    glossary: Dict[str, str] | None = None,
+) -> str:
+    """Check each ``[EN-N]`` / ``[ZH-N]`` pair for inline-math count
+    mismatches and re-translate the offending sentences individually.
+
+    When the LLM processes large JSON batches (25 sentences), it
+    occasionally shuffles ``⟨INLINEMATH:N⟩`` placeholders across
+    sentence boundaries.  Single-sentence translation is immune to
+    this because there is only one sentence in the batch.
+    """
+    # Split the bilingual output into blocks: each block is
+    #   [EN-N] line
+    #   [ZH-N] line
+    #   (blank line)
+    #   *** separator
+    # Structural blocks and headings also use *** separators but
+    # lack the [EN-N]/[ZH-N] anchors, so they are easy to skip.
+    lines = text.split("\n")
+    out_lines: List[str] = []
+    i = 0
+    fixed_count = 0
+
+    while i < len(lines):
+        line = lines[i]
+        en_m = re.match(r"^\[EN-(\d+)\]\s+(.+)", line)
+        if not en_m:
+            out_lines.append(line)
+            i += 1
+            continue
+
+        en_num = en_m.group(1)
+        en_body = en_m.group(2)
+        en_dollar = en_body.count("$")
+
+        # Next line should be the matching [ZH-N]
+        zh_line = ""
+        zh_body = ""
+        zh_dollar = -1
+        if i + 1 < len(lines):
+            zh_m = re.match(r"^\[ZH-" + en_num + r"\]\s+(.+)", lines[i + 1])
+            if zh_m:
+                zh_body = zh_m.group(1)
+                zh_line = lines[i + 1]
+                zh_dollar = zh_body.count("$")
+
+        if zh_dollar >= 0 and en_dollar == zh_dollar:
+            # Counts match — keep as-is
+            out_lines.append(line)
+            out_lines.append(zh_line)
+            i += 2
+            continue
+
+        # Mismatch or missing ZH — re-translate this single sentence
+        print(
+            f"  ⚠  [#{en_num}] inline-math mismatch "
+            f"(EN:{en_dollar} ZH:{zh_dollar}) — re-translating",
+            file=sys.stderr,
+        )
+
+        try:
+            new_translations = _translate_one_batch(
+                [en_body], api_key, model, src, tgt, glossary
             )
-            plain_block = "$$\n" + plain + "\n$$"
-            if plain_block in text:
-                text = text.replace(m.group(0), "")
-                changed = True
-                break
-    text = re.sub(r"(?<=\n)> \$\$\n(?=\n)", "", text)
-    return re.sub(r"\n{3,}", "\n\n", text)
+            new_zh = new_translations[0]
+            new_zh_dollar = new_zh.count("$")
+            if new_zh_dollar == en_dollar:
+                out_lines.append(line)
+                out_lines.append(f"[ZH-{en_num}] {new_zh}")
+                fixed_count += 1
+                i += 2
+                continue
+            else:
+                print(
+                    f"  ⚠  [#{en_num}] re-translate also mismatched "
+                    f"(EN:{en_dollar} ZH:{new_zh_dollar}) — keeping original",
+                    file=sys.stderr,
+                )
+        except Exception as exc:
+            print(
+                f"  ⚠  [#{en_num}] re-translate failed: {exc}",
+                file=sys.stderr,
+            )
+
+        # Keep original (either re-translate failed or still mismatched)
+        out_lines.append(line)
+        if zh_line:
+            out_lines.append(zh_line)
+            i += 2
+        else:
+            i += 1
+
+    if fixed_count:
+        print(
+            f"  ✓  fixed {fixed_count} inline-math mismatches",
+            file=sys.stderr,
+        )
+
+    return "\n".join(out_lines)
 
 
 def _sanitize_math_delimiters(text: str) -> str:
@@ -1052,6 +1154,83 @@ def _sanitize_math_delimiters(text: str) -> str:
             if trailing.strip() and all(c in ".!?,;: " for c in trailing):
                 lines[i] = line.replace(s, "$$", 1)
     return "\n".join(lines)
+
+
+def _clean_latex(text: str) -> str:
+    """Post-process LaTeX formulas for Obsidian compatibility.
+
+    * Compresses redundant token-spaces inside ``$...$`` and ``$$...$$``
+      (e.g. ``$u _ { k }$`` → ``$u_{k}$``).
+    * Externalises trailing punctuation from inline math
+      (e.g. ``$x^2.$`` → ``$x^2$ .``).
+    * Converts bare ``<`` / ``>`` inside math to ``\\lt`` / ``\\gt``
+      to prevent HTML-tag parser deadlocks.
+    * Ensures ``$$`` fences are isolated on their own lines with
+      blank-line separation from surrounding text.
+    """
+
+    # ── step 1: inline math $...$ (single $, never $$) ────────────────
+    def _clean_inline(m: re.Match) -> str:
+        body = m.group(1)
+        body = re.sub(r"\s+([_{}^])", r"\1", body)
+        body = re.sub(r"([_{}^])\s+", r"\1", body)
+        body = re.sub(r"(?<!\\)<(?![a-zA-Z])", r"\\lt ", body)
+        body = re.sub(r"(?<!\\)>(?![a-zA-Z])", r"\\gt ", body)
+        body = body.rstrip()
+        m2 = re.match(r"^([\s\S]*?)([.,;:!?。，；：！？]+)$", body)
+        if m2:
+            return f"${m2.group(1).rstrip()}${m2.group(2)}"
+        return f"${body}$"
+
+    text = re.sub(r"(?<!\$)\$(?!\$)(.+?)\$(?!\$)", _clean_inline, text)
+
+    # ── step 2: display math $$...$$ ──────────────────────────────────
+    # Space compression is safe to apply globally: _, {, }, ^ are LaTeX
+    # token delimiters that never appear adjacent to spaces in prose.
+    # Doing this globally avoids $$-pairing issues when the bilingual
+    # output has stray $$ markers around prose text.
+    text = re.sub(r"\s+([_{}^])", r"\1", text)
+    text = re.sub(r"([_{}^])\s+", r"\1", text)
+
+    # < > → \lt \gt only inside display-math blocks identified via
+    # line-by-line state machine (which pairs $$ on their own line).
+    # This avoids corrupting HTML tags or Markdown outside math.
+    lines = text.split("\n")
+    in_dm = False
+    dm_start = -1
+
+    for i, line in enumerate(lines):
+        is_dd = line.strip() == "$$"
+        if is_dd and not in_dm:
+            in_dm = True
+            dm_start = i
+        elif is_dd and in_dm:
+            in_dm = False
+            content = "\n".join(lines[dm_start + 1 : i])
+            # Only convert <> in blocks that look like real LaTeX math
+            if "\\" in content:
+                content = re.sub(
+                    r"(?<!\\)<(?![a-zA-Z])", r"\\lt ", content
+                )
+                content = re.sub(
+                    r"(?<!\\)>(?![a-zA-Z])", r"\\gt ", content
+                )
+                # Replace content lines
+                lines[dm_start + 1 : i] = [content]
+        # else: in_dm and not $$ — accumulate (done implicitly in lines)
+
+    text = "\n".join(lines)
+
+    # ── step 3: $$ fence isolation (blank-line padding) ──────────────
+    text = re.sub(r"(\S)\s*\$\$", r"\1\n\n$$", text)
+    text = re.sub(r"\$\$\s*(\S)", r"$$\n\n\1", text)
+    text = re.sub(r"([^\n])\n\$\$", r"\1\n\n$$", text)
+    text = re.sub(r"\$\$\n([^\n])", r"$$\n\n\1", text)
+
+    # ── step 4: collapse excessive blank runs ────────────────────────
+    text = re.sub(r"\n{4,}", "\n\n\n", text)
+
+    return text
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
@@ -1221,21 +1400,27 @@ def main() -> None:
         full_translation = "\n\n".join(all_trans)
         full_translation = _dedupe_headings(full_translation)
         out_text = restore(full_translation, placeholders)
+        out_text = _fix_adjacent_inline_math(out_text)
         out_text = _sanitize_math_delimiters(out_text)
     else:
         # Per-chunk bilingual: sentence arrays are already 1:1 aligned.
-        # Restore placeholders in each sentence, then format.
+        # Restore placeholders in each sentence, then format with
+        # global numbering across all chunks.
         bilingual_parts: List[str] = []
+        num = 1
         for i in range(len(chunks)):
             orig_sents, trans_sents = results[i]
             orig_restored = [restore(s, placeholders) for s in orig_sents]
             trans_restored = [restore(s, placeholders) for s in trans_sents]
-            bilingual_parts.append(
-                _format_bilingual_chunk(orig_restored, trans_restored)
+            text, num = _format_bilingual_chunk(
+                orig_restored, trans_restored, start_num=num
             )
+            bilingual_parts.append(text)
         out_text = "\n\n".join(bilingual_parts)
         out_text = _dedupe_headings(out_text)
+        out_text = _fix_adjacent_inline_math(out_text)
         out_text = _sanitize_math_delimiters(out_text)
+        out_text = _clean_latex(out_text)
 
     # --- output --------------------------------------------------------------
     if args.output:

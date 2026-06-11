@@ -7,7 +7,7 @@ description: Translate Markdown documents into bilingual (source↔target) forma
 
 Preserves **formulas (LaTeX)**, **LaTeX commands** (`\textbf`, `\frac`, `\alpha`, `\begin`/`\end` environments, etc.), **code blocks**, **tables**, **images**, **links**, **HTML**, and **frontmatter** during translation so the output stays structurally identical to the input.  Long documents are split at heading boundaries (`##` / `###`) and translated chunk-by-chunk via the DeepSeek API.
 
-Output is **sentence-by-sentence bilingual**: each original sentence (blockquoted) is immediately followed by its translation, with blank lines between pairs for comfortable reading in Typora and similar renderers.
+Output is **sentence-by-sentence bilingual**.  Each English sentence and its Chinese translation form a tight visual group separated by ``***`` dividers.  LaTeX formulas are cleaned for Obsidian compatibility.
 
 ## When to Use
 
@@ -53,10 +53,11 @@ python3 ~/.claude/skills/markdown-translator/scripts/translate.py \
 
 ### Model selection
 
-The default model is `deepseek-chat`.  To use a specific model:
+The default model is `deepseek-v4-flash`.  To use a specific model:
 
 ```bash
-python3 … --model deepseek-chat       # latest (v4)
+python3 … --model deepseek-v4-flash   # fast, cost-effective (default)
+python3 … --model deepseek-chat       # latest general-purpose
 python3 … --model deepseek-reasoner   # reasoning model
 ```
 
@@ -64,37 +65,39 @@ Set the `DEEPSEEK_API_KEY` environment variable or pass `--api-key` explicitly.
 
 ## Translation Strategy
 
-The script uses a **protect → chunk → translate → restore** pipeline:
+The script uses a **protect → chunk → split → translate → restore → clean** pipeline:
 
 1. **Protect** — code blocks, inline code, LaTeX math (`$` / `$$`, `\(` / `\)`, `\[` / `\]`), LaTeX commands (`\textbf{…}`, `\frac{…}{…}`, `\begin{…}…\end{…}`, etc.), images, HTML tags, and frontmatter are replaced with opaque placeholders (`⟨CODEBLOCK:0⟩`, `⟨MATHBLOCK:1⟩`, `⟨LATEXCMD:2⟩`, etc.)
-2. **Chunk** — the sanitised text is split at `##` / `###` boundaries, keeping each chunk under the `--max-chars` limit.  If a single section still exceeds the limit it is further split on paragraph breaks.
-3. **Translate** — each chunk is sent to the DeepSeek API with a system prompt that enforces placeholder preservation, paragraph-structure fidelity, and register matching
-4. **Restore** — placeholders in the translation output are swapped back to their original content
-5. **Format** — in bilingual mode, sentences are interleaved (original blockquoted, translation plain) with blank lines between pairs.  Falls back gracefully to paragraph-level or section-level alignment when sentence/paragraph counts drift.
+2. **Chunk** — the sanitised text is split at `##` / `###` boundaries, keeping each chunk under the `--max-chars` limit
+3. **Split** — each chunk is sentence-split with regex (abbreviation-aware, heading-number protected), structural blocks separated from prose, and translatable sentences identified
+4. **Translate** — prose sentences are batch-translated via JSON array API call, guaranteeing output length = input length for strict 1:1 alignment.  Structural blocks (math, code) and headings are preserved as-is
+5. **Restore** — placeholders in the aligned sentence pairs are swapped back to their original content
+6. **Clean** — LaTeX formulas are post-processed for Obsidian: spaces compressed, punctuation externalised, `<`/`>` converted to `\lt`/`\gt`, `$$` fences isolated with blank-line padding
 
 ## Bilingual Output Format
 
 ```
-## Section Heading
+## Section Heading (translated)
 
-> Original English sentence that introduces the topic.
-
-介绍该主题的中文翻译句子。
-
-> Another English sentence with **bold** and *italic* text.
-
-另一个带有**粗体**和*斜体*的中文翻译句子。
-
-> A third sentence containing inline math $x^2$ and a LaTeX command.
-
-包含行内公式 $x^2$ 和 LaTeX 命令的第三个句子。
+Score-based diffusion generative models have recently emerged as a standard tool.
+基于得分的扩散生成模型最近已成为标准工具。
+***
+These models aim at learning the score function via SDEs.
+这些模型旨在通过 SDE 学习得分函数。
+***
+$$
+u_{k}(t) = \sum_{j=1}^{m} (\gamma^{-1})_{jk} D_{t} X_{T}^{j}.
+$$
+***
+Our approach combines Malliavin derivatives with a novel Bismut-type formula.
+我们的方法将马利亚万导数与新的 Bismut 型公式相结合。
 ```
 
-- Original text is blockquoted (`> ` prefix)
-- Translation follows immediately as plain text
-- A blank line separates each sentence pair for Typora readability
-- Protected elements (code, math, LaTeX commands, images) appear identically in both versions
-- When sentence counts don't align (rare), the section falls back to paragraph-level alignment
+- Each English↔Chinese pair is a tight visual group (no blank line between them)
+- ``***`` horizontal rule separates consecutive sentence groups
+- Structural blocks (display math, code, LaTeX environments) appear standalone between dividers
+- Headings are translated and emitted once
+- LaTeX formulas are cleaned: no token-spaces, punctuation externalised, ``<``/``>`` escaped
 
 ## Error Handling
 
@@ -104,11 +107,11 @@ The script uses a **protect → chunk → translate → restore** pipeline:
 | `HTTP 429` | Script auto-retries with exponential backoff; wait and re-run |
 | `HTTP 401` | API key is invalid or expired — check at platform.deepseek.com |
 | Translation quality is poor on a specific chunk | Re-run with `--max-chars 2000` for smaller, higher-fidelity chunks |
-| Paragraph alignment is off | Re-run with `--no-bilingual` for a clean single-language output |
+| Sentence alignment is off (rare) | Re-run with `--no-bilingual` for a clean single-language output |
 
 ## Tips for Best Results
 
-- **Chunk size**: 3000–5000 chars per chunk gives the best balance of context vs. quality.  Smaller chunks = better consistency but more API calls.
+- **Chunk size**: 5000–8000 chars per chunk gives the best balance of context vs. quality.  Smaller chunks = better consistency but more API calls.
 - **Language codes**: Use ISO 639-1 codes (`en`, `zh`, `ja`, `ko`, `fr`, `de`, …).  For Chinese specifically, the model understands `zh` as simplified Chinese.
 - **Technical content**: The default temperature of 0.2 keeps terminology stable across chunks.
 - **Review**: Always skim the output — the interleaved format makes it easy to spot-check translations against the original.
@@ -119,7 +122,7 @@ The script uses a **protect → chunk → translate → restore** pipeline:
 |------|---------|-------------|
 | `--from` / `--to` | `en` / `zh` | Source and target language codes |
 | `--model` | `deepseek-chat` | DeepSeek model name |
-| `--max-chars` | `5000` | Characters per API chunk |
+| `--max-chars` | `8000` | Characters per API chunk |
 | `--no-bilingual` | off | Emit translation only (no original) |
 | `--dry-run` | off | Show chunk plan without API calls |
 | `--api-key` | `$DEEPSEEK_API_KEY` | Override API key |
