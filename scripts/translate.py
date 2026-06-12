@@ -998,16 +998,36 @@ def _format_bilingual_chunk(
             out.append("")
             first = False
 
-        # Prose — tightly-coupled English / Chinese pair
+        # Prose — English / Chinese pair with blank line between
         else:
             _separator()
             out.append(os_)
+            out.append("")
             out.append(ts)
             out.append("")
             n += 1
             first = False
 
     return "\n".join(out).strip(), n
+
+
+def _remove_stale_placeholders(text: str) -> str:
+    """Remove any ``⟨XXX:N⟩`` placeholders left behind after restore.
+
+    These arise when the LLM hallucinates placeholder IDs that don't exist
+    in the original placeholder map, so :func:`restore` can't replace them.
+    We strip them to prevent their ``⟨``/``⟩`` angle brackets from breaking
+    LaTeX math rendering in editors like Obsidian.
+    """
+    count_before = text.count("⟨")
+    text = re.sub(r"⟨[A-Z]+:\d+⟩", "", text)
+    removed = count_before - text.count("⟨")
+    if removed:
+        print(
+            f"  ⚠  removed {removed} stale placeholder(s)",
+            file=sys.stderr,
+        )
+    return text
 
 
 def _fix_adjacent_inline_math(text: str) -> str:
@@ -1421,6 +1441,7 @@ def main() -> None:
         out_text = _fix_adjacent_inline_math(out_text)
         out_text = _sanitize_math_delimiters(out_text)
         out_text = _clean_latex(out_text)
+        out_text = _remove_stale_placeholders(out_text)
 
     # --- output --------------------------------------------------------------
     if args.output:
